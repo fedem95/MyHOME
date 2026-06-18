@@ -2,30 +2,29 @@
 
 import aiofiles
 import yaml
-
-from OWNd.message import OWNCommand, OWNGatewayCommand
-
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
+from homeassistant.const import CONF_MAC
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr, entity_registry as er, config_validation as cv
-from homeassistant.const import CONF_MAC
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from OWNd.message import OWNCommand, OWNGatewayCommand
 
 from .const import (
     ATTR_GATEWAY,
     ATTR_MESSAGE,
-    CONF_PLATFORMS,
-    CONF_ENTITY,
     CONF_ENTITIES,
-    CONF_GATEWAY,
-    CONF_WORKER_COUNT,
+    CONF_ENTITY,
     CONF_FILE_PATH,
     CONF_GENERATE_EVENTS,
+    CONF_PLATFORMS,
+    CONF_WORKER_COUNT,
     DOMAIN,
     LOGGER,
 )
-from .validate import config_schema, format_mac
 from .gateway import MyHOMEGatewayHandler
+from .validate import config_schema, format_mac
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS = ["light", "switch", "cover", "climate", "binary_sensor", "sensor"]
@@ -52,17 +51,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         if CONF_FILE_PATH in entry.options
         else "/config/myhome.yaml"
     )
-    _generate_events = (
-        entry.options[CONF_GENERATE_EVENTS]
-        if CONF_GENERATE_EVENTS in entry.options
-        else False
-    )
+    _generate_events = entry.options.get(CONF_GENERATE_EVENTS, False)
 
     try:
-        async with aiofiles.open(_config_file_path, mode="r") as yaml_file:
+        async with aiofiles.open(_config_file_path) as yaml_file:
             _validated_config = config_schema(yaml.safe_load(await yaml_file.read()))
     except FileNotFoundError:
-        LOGGER.error(f"Configartion file '{_config_file_path}' is not present!")
+        LOGGER.error("Configuration file '%s' is not present!", _config_file_path)
         return False
 
     if entry.data[CONF_MAC] in _validated_config:
@@ -87,27 +82,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         tests_results = await hass.data[DOMAIN][entry.data[CONF_MAC]][
             CONF_ENTITY
         ].test()
-    except OSError as ose:
-        _gateway_handler = hass.data[DOMAIN].pop(CONF_GATEWAY)
-        _host = _gateway_handler.gateway.host
+    except (OSError, EOFError, TimeoutError) as err:
+        # Transient connection failures: the gateway may not be ready yet right
+        # after a reboot/power-cycle (it accepts the TCP connection then closes
+        # it during negotiation -> asyncio.IncompleteReadError, a subclass of
+        # EOFError). Raising ConfigEntryNotReady lets HA retry the setup
+        # automatically with backoff instead of failing hard and requiring a
+        # manual reload. (ConnectionError is a subclass of OSError.)
+        _host = hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].gateway.host
+        hass.data[DOMAIN][entry.data[CONF_MAC]].pop(CONF_ENTITY, None)
         raise ConfigEntryNotReady(
-            f"Gateway cannot be reached at {_host}, make sure its address is correct."
-        ) from ose
+            f"Gateway at {_host} is not ready yet; will retry."
+        ) from err
 
-    if not tests_results["Success"]:
-        if (
-            tests_results["Message"] == "password_error"
-            or tests_results["Message"] == "password_required"
-        ):
-            hass.async_create_task(
-                hass.config_entries.flow.async_init(
-                    DOMAIN,
-                    context={"source": SOURCE_REAUTH},
-                    data=entry.data,
-                )
+    # A password problem is permanent and must be handled with a reauth flow,
+    # never retried in a loop.
+    if tests_results is not None and not tests_results["Success"] and tests_results[
+        "Message"
+    ] in ("password_error", "password_required"):
+        hass.async_create_task(
+            hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": SOURCE_REAUTH},
+                data=entry.data,
             )
-        del hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY]
+        )
+        hass.data[DOMAIN][entry.data[CONF_MAC]].pop(CONF_ENTITY, None)
         return False
+
+    # Any other negotiation failure (including test() returning None, which the
+    # library may do on a refused/EOF connection) is treated as transient ->
+    # retry rather than give up.
+    if tests_results is None or not tests_results["Success"]:
+        _host = hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].gateway.host
+        hass.data[DOMAIN][entry.data[CONF_MAC]].pop(CONF_ENTITY, None)
+        raise ConfigEntryNotReady(
+            f"Gateway at {_host} did not negotiate a session; will retry."
+        )
 
     _command_worker_count = (
         int(entry.options[CONF_WORKER_COUNT])
@@ -134,15 +145,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         entry, hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS].keys()
     )
 
-    hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].listening_worker = (
-        hass.loop.create_task(
-            hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].listening_loop()
-        )
+    # Long-running workers as tracked background tasks tied to the config entry:
+    # HA cancels them automatically on unload/reload (no lingering tasks).
+    _handler = hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY]
+    _handler.listening_worker = entry.async_create_background_task(
+        hass,
+        _handler.listening_loop(),
+        name=f"myhome-{entry.data[CONF_MAC]}-listener",
     )
     for i in range(_command_worker_count):
-        hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].sending_workers.append(
-            hass.loop.create_task(
-                hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_ENTITY].sending_loop(i)
+        _handler.sending_workers.append(
+            entry.async_create_background_task(
+                hass,
+                _handler.sending_loop(i),
+                name=f"myhome-{entry.data[CONF_MAC]}-sender-{i}",
             )
         )
 
@@ -158,10 +174,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     configured_entities = []
 
-    for _platform in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS].keys():
+    for _platform in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS]:
         for _device in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS][
             _platform
-        ].keys():
+        ]:
             for _entity_name in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS][
                 _platform
             ][_device][CONF_ENTITIES]:
@@ -199,6 +215,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             device_registry.async_remove_device(device_id)
 
     # Defining the services
+
     async def handle_sync_time(call):
         gateway = call.data.get(ATTR_GATEWAY, None)
         if gateway is None:
@@ -211,8 +228,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     gateway,
                 )
                 return False
-            else:
-                gateway = mac
+            gateway = mac
         timezone = hass.config.as_dict()["time_zone"]
         if gateway in hass.data[DOMAIN]:
             await hass.data[DOMAIN][gateway][CONF_ENTITY].send(
@@ -224,6 +240,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 gateway,
             )
             return False
+        return True
 
     hass.services.async_register(DOMAIN, "sync_time", handle_sync_time)
 
@@ -241,8 +258,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     message,
                 )
                 return False
-            else:
-                gateway = mac
+            gateway = mac
         LOGGER.debug("Handling message `%s` to be sent to `%s`", message, gateway)
         if gateway in hass.data[DOMAIN]:
             if message is not None:
@@ -265,6 +281,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 "Gateway `%s` not found, could not send message `%s`.", gateway, message
             )
             return False
+        return True
 
     hass.services.async_register(DOMAIN, "send_message", handle_send_message)
 
@@ -276,8 +293,10 @@ async def async_unload_entry(hass, entry):
 
     LOGGER.info("Unloading MyHome entry.")
 
-    for platform in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS].keys():
-        await hass.config_entries.async_forward_entry_unload(entry, platform)
+    platforms = list(
+        hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS].keys()
+    )
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
     hass.services.async_remove(DOMAIN, "sync_time")
     hass.services.async_remove(DOMAIN, "send_message")
@@ -285,4 +304,10 @@ async def async_unload_entry(hass, entry):
     gateway_handler = hass.data[DOMAIN][entry.data[CONF_MAC]].pop(CONF_ENTITY)
     del hass.data[DOMAIN][entry.data[CONF_MAC]]
 
-    return await gateway_handler.close_listener()
+    # Signal the loops to stop; the background tasks created via
+    # entry.async_create_background_task are cancelled by HA on unload.
+    await gateway_handler.close_listener()
+
+    return unload_ok
+
+

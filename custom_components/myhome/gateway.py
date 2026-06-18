@@ -1,72 +1,63 @@
 """Code to handle a MyHome Gateway."""
 import asyncio
-from typing import Dict, List
 
-from homeassistant.const import (
-    CONF_ENTITIES,
-    CONF_HOST,
-    CONF_PORT,
-    CONF_PASSWORD,
-    CONF_NAME,
-    CONF_MAC,
-    CONF_FRIENDLY_NAME,
-)
-from homeassistant.components.light import DOMAIN as LIGHT
-from homeassistant.components.switch import (
-    SwitchDeviceClass,
-    DOMAIN as SWITCH,
-)
 from homeassistant.components.button import DOMAIN as BUTTON
-from homeassistant.components.cover import DOMAIN as COVER
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    DOMAIN as BINARY_SENSOR,
-)
+from homeassistant.components.light import DOMAIN as LIGHT
 from homeassistant.components.sensor import (
-    SensorDeviceClass,
     DOMAIN as SENSOR,
 )
-from homeassistant.components.climate import DOMAIN as CLIMATE
-
-from OWNd.connection import OWNSession, OWNEventSession, OWNCommandSession, OWNGateway
+from homeassistant.const import (
+    CONF_ENTITIES,
+    CONF_FRIENDLY_NAME,
+    CONF_HOST,
+    CONF_MAC,
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_PORT,
+)
+from OWNd.connection import OWNCommandSession, OWNEventSession, OWNGateway, OWNSession
 from OWNd.message import (
-    OWNMessage,
-    OWNLightingEvent,
-    OWNLightingCommand,
-    OWNEnergyEvent,
     OWNAutomationEvent,
-    OWNDryContactEvent,
     OWNAuxEvent,
-    OWNHeatingEvent,
-    OWNHeatingCommand,
-    OWNCENPlusEvent,
     OWNCENEvent,
-    OWNGatewayEvent,
-    OWNGatewayCommand,
+    OWNCENPlusEvent,
     OWNCommand,
+    OWNDryContactEvent,
+    OWNEnergyEvent,
+    OWNGatewayCommand,
+    OWNGatewayEvent,
+    OWNHeatingCommand,
+    OWNHeatingEvent,
+    OWNLightingCommand,
+    OWNLightingEvent,
+    OWNMessage,
 )
 
-from .const import (
-    CONF_PLATFORMS,
-    CONF_FIRMWARE,
-    CONF_SSDP_LOCATION,
-    CONF_SSDP_ST,
-    CONF_DEVICE_TYPE,
-    CONF_MANUFACTURER,
-    CONF_MANUFACTURER_URL,
-    CONF_UDN,
-    CONF_SHORT_PRESS,
-    CONF_SHORT_RELEASE,
-    CONF_LONG_PRESS,
-    CONF_LONG_RELEASE,
-    DOMAIN,
-    LOGGER,
-)
-from .myhome_device import MyHOMEEntity
 from .button import (
     DisableCommandButtonEntity,
     EnableCommandButtonEntity,
 )
+from .const import (
+    CONF_DEVICE_TYPE,
+    CONF_FIRMWARE,
+    CONF_LONG_PRESS,
+    CONF_LONG_RELEASE,
+    CONF_MANUFACTURER,
+    CONF_MANUFACTURER_URL,
+    CONF_PLATFORMS,
+    CONF_SHORT_PRESS,
+    CONF_SHORT_RELEASE,
+    CONF_SSDP_LOCATION,
+    CONF_SSDP_ST,
+    CONF_UDN,
+    DOMAIN,
+    LOGGER,
+)
+from .myhome_device import MyHOMEEntity
+
+# Max time a command worker waits for the event session to come up before it
+# gives up (the OWNd connect() already retries internally with backoff).
+EVENT_READY_TIMEOUT = 120
 
 
 class MyHOMEGatewayHandler:
@@ -95,8 +86,9 @@ class MyHOMEGatewayHandler:
         self._terminate_listener = False
         self._terminate_sender = False
         self.is_connected = False
-        self.listening_worker: asyncio.tasks.Task = None
-        self.sending_workers: List[asyncio.tasks.Task] = []
+        self._event_session_ready = asyncio.Event()  # Nuovo evento per sincronizzazione
+        self.listening_worker: asyncio.Task | None = None
+        self.sending_workers: list[asyncio.Task] = []
         self.send_buffer = asyncio.Queue()
 
     @property
@@ -127,7 +119,7 @@ class MyHOMEGatewayHandler:
     def firmware(self) -> str:
         return self.gateway.firmware
 
-    async def test(self) -> Dict:
+    async def test(self) -> dict:
         return await OWNSession(gateway=self.gateway, logger=LOGGER).test_connection()
 
     async def listening_loop(self):
@@ -136,8 +128,24 @@ class MyHOMEGatewayHandler:
         LOGGER.debug("%s Creating listening worker.", self.log_id)
 
         _event_session = OWNEventSession(gateway=self.gateway, logger=LOGGER)
-        await _event_session.connect()
+        try:
+            await _event_session.connect()
+        except Exception:
+            # Never leave the command workers blocked forever on a readiness
+            # signal that will never arrive: surface the failure (the task ends,
+            # and the entry-level retry logic can take over) instead of dying
+            # silently with the event still unset.
+            self.is_connected = False
+            LOGGER.exception(
+                "%s Event session could not be established.", self.log_id
+            )
+            raise
+
         self.is_connected = True
+        self._event_session_ready.set()  # Event session up: command sessions may start.
+        LOGGER.debug(
+            "%s Event session ready, command sessions can now start.", self.log_id
+        )
 
         while not self._terminate_listener:
             message = await _event_session.get_next()
@@ -167,12 +175,15 @@ class MyHOMEGatewayHandler:
                             self.hass.data[DOMAIN][self.mac][CONF_PLATFORMS][SENSOR][message.entity][CONF_ENTITIES][_entity].handle_event(message)
                 else:
                     continue
-            elif (
-                isinstance(message, OWNLightingEvent)
-                or isinstance(message, OWNAutomationEvent)
-                or isinstance(message, OWNDryContactEvent)
-                or isinstance(message, OWNAuxEvent)
-                or isinstance(message, OWNHeatingEvent)
+            elif isinstance(
+                message,
+                (
+                    OWNLightingEvent,
+                    OWNAutomationEvent,
+                    OWNDryContactEvent,
+                    OWNAuxEvent,
+                    OWNHeatingEvent,
+                ),
             ):
                 if not message.is_translation:
                     is_event = False
@@ -344,7 +355,7 @@ class MyHOMEGatewayHandler:
                     self.log_id,
                     message.human_readable_log,
                 )
-            elif isinstance(message, OWNGatewayEvent) or isinstance(message, OWNGatewayCommand):
+            elif isinstance(message, (OWNGatewayEvent, OWNGatewayCommand)):
                 LOGGER.info(
                     "%s %s",
                     self.log_id,
@@ -361,7 +372,6 @@ class MyHOMEGatewayHandler:
         self.is_connected = False
 
         LOGGER.debug("%s Destroying listening worker.", self.log_id)
-        self.listening_worker.cancel()
 
     async def sending_loop(self, worker_id: int):
         self._terminate_sender = False
@@ -372,19 +382,54 @@ class MyHOMEGatewayHandler:
             worker_id,
         )
 
+        # Wait for the event session to be established before opening the command
+        # session: the MH201 cannot negotiate both at the same time. Bounded, so
+        # a never-ready event session cannot hang this worker forever.
+        LOGGER.debug(
+            "%s Worker %s waiting for event session to be ready...",
+            self.log_id,
+            worker_id,
+        )
+        try:
+            await asyncio.wait_for(
+                self._event_session_ready.wait(), timeout=EVENT_READY_TIMEOUT
+            )
+        except TimeoutError:
+            LOGGER.error(
+                "%s Worker %s: event session not ready after %ss; aborting worker.",
+                self.log_id,
+                worker_id,
+                EVENT_READY_TIMEOUT,
+            )
+            return
+        LOGGER.debug(
+            "%s Worker %s: event session is ready, proceeding with command session.",
+            self.log_id,
+            worker_id,
+        )
+
         _command_session = OWNCommandSession(gateway=self.gateway, logger=LOGGER)
-        await _command_session.connect()
+        try:
+            await _command_session.connect()
+        except Exception:
+            LOGGER.exception(
+                "%s Worker %s: command session could not be established.",
+                self.log_id,
+                worker_id,
+            )
+            return
 
         while not self._terminate_sender:
             task = await self.send_buffer.get()
             LOGGER.debug(
                 "%s Message `%s` was successfully unqueued by worker %s.",
-                self.name,
-                self.gateway.host,
+                self.log_id,
                 task["message"],
                 worker_id,
             )
-            await _command_session.send(message=task["message"], is_status_request=task["is_status_request"])
+            await _command_session.send(
+                message=task["message"], is_status_request=task["is_status_request"]
+            )
             self.send_buffer.task_done()
 
         await _command_session.close()
