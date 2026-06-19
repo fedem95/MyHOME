@@ -15,6 +15,9 @@ from homeassistant.const import (
     CONF_PASSWORD,
     CONF_PORT,
 )
+from homeassistant.core import callback
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later
 from OWNd.connection import OWNCommandSession, OWNEventSession, OWNGateway, OWNSession
 from OWNd.message import (
     OWNAutomationEvent,
@@ -59,6 +62,13 @@ from .myhome_device import MyHOMEEntity
 # gives up (the OWNd connect() already retries internally with backoff).
 EVENT_READY_TIMEOUT = 120
 
+# An event-session outage must persist this long AFTER OWNd has already
+# exhausted its own reconnection attempts (~13-40s) before the entities are
+# marked unavailable. Routine ~58min session recycles recover in <1s and never
+# emit a state-change, so they never reach this. Total perceived outage before
+# entities go unavailable is roughly AVAILABILITY_GRACE + OWNd's give-up window.
+AVAILABILITY_GRACE = 60
+
 
 class MyHOMEGatewayHandler:
     """Manages a single MyHOME Gateway."""
@@ -86,6 +96,8 @@ class MyHOMEGatewayHandler:
         self._terminate_listener = False
         self._terminate_sender = False
         self.is_connected = False
+        self._available = True
+        self._unavailable_timer = None
         self._event_session_ready = asyncio.Event()  # Nuovo evento per sincronizzazione
         self.listening_worker: asyncio.Task | None = None
         self.sending_workers: list[asyncio.Task] = []
@@ -119,6 +131,62 @@ class MyHOMEGatewayHandler:
     def firmware(self) -> str:
         return self.gateway.firmware
 
+    @property
+    def available(self) -> bool:
+        """Filtered availability the entities derive their own from."""
+        return self._available
+
+    @property
+    def availability_signal(self) -> str:
+        """Dispatcher signal fired when the gateway availability changes."""
+        return f"{DOMAIN}_{self.mac}_availability"
+
+    @callback
+    def _on_connection_state_change(self, connected: bool) -> None:
+        """Invoked by OWNd (in the event loop) on real connection transitions.
+
+        OWNd only flips to False after exhausting its own reconnection attempts,
+        so routine ~58min recycles never reach here. We add a grace period on
+        top: only a *sustained* outage marks the entities unavailable, and a
+        recovery within the grace window is completely silent.
+        """
+        if connected:
+            if self._unavailable_timer is not None:
+                self._unavailable_timer()
+                self._unavailable_timer = None
+            if not self._available:
+                self._available = True
+                LOGGER.info("%s Gateway available again.", self.log_id)
+                self._notify_availability()
+        elif self._unavailable_timer is None and self._available:
+            LOGGER.warning(
+                "%s Gateway connection lost; marking unavailable in %ss "
+                "if not recovered.",
+                self.log_id,
+                AVAILABILITY_GRACE,
+            )
+            self._unavailable_timer = async_call_later(
+                self.hass, AVAILABILITY_GRACE, self._mark_unavailable
+            )
+
+    @callback
+    def _mark_unavailable(self, _now) -> None:
+        """Grace period elapsed without recovery: entities go unavailable."""
+        self._unavailable_timer = None
+        if self._available:
+            self._available = False
+            LOGGER.warning(
+                "%s Gateway unavailable (outage exceeded %ss).",
+                self.log_id,
+                AVAILABILITY_GRACE,
+            )
+            self._notify_availability()
+
+    @callback
+    def _notify_availability(self) -> None:
+        """Tell every entity bound to this gateway to re-render availability."""
+        async_dispatcher_send(self.hass, self.availability_signal)
+
     async def test(self) -> dict:
         return await OWNSession(gateway=self.gateway, logger=LOGGER).test_connection()
 
@@ -127,7 +195,11 @@ class MyHOMEGatewayHandler:
 
         LOGGER.debug("%s Creating listening worker.", self.log_id)
 
-        _event_session = OWNEventSession(gateway=self.gateway, logger=LOGGER)
+        _event_session = OWNEventSession(
+            gateway=self.gateway,
+            logger=LOGGER,
+            on_state_change=self._on_connection_state_change,
+        )
         try:
             await _event_session.connect()
         except Exception:
@@ -445,6 +517,9 @@ class MyHOMEGatewayHandler:
         LOGGER.info("%s Closing event listener", self.log_id)
         self._terminate_sender = True
         self._terminate_listener = True
+        if self._unavailable_timer is not None:
+            self._unavailable_timer()
+            self._unavailable_timer = None
 
         return True
 

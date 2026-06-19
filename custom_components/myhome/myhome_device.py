@@ -1,16 +1,17 @@
 """Support for common values for MyHome devices."""
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .gateway import MyHOMEGatewayHandler
 
+from homeassistant.core import callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
-from homeassistant.const import CONF_ENTITIES
 
-
-from .const import DOMAIN, CONF_PLATFORMS, CONF_ENTITIES
+from .const import CONF_ENTITIES, CONF_PLATFORMS, DOMAIN
 
 
 class MyHOMEEntity(Entity):
@@ -48,9 +49,27 @@ class MyHOMEEntity(Entity):
             "via_device": (DOMAIN, self._gateway_handler.unique_id),
         }
 
+    @property
+    def available(self) -> bool:
+        """Entities are available only while the gateway is (grace-filtered)."""
+        return self._gateway_handler.available
+
+    @callback
+    def _handle_availability_update(self) -> None:
+        """Re-render availability when the gateway connection state changes."""
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self):
         """When entity is added to hass."""
         self._hass.data[DOMAIN][self._gateway_handler.mac][CONF_PLATFORMS][self._platform][self._device_id][CONF_ENTITIES][self._platform] = self
+        # Re-render this entity whenever the gateway availability flips.
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self._hass,
+                self._gateway_handler.availability_signal,
+                self._handle_availability_update,
+            )
+        )
         await self.async_update()
 
     async def async_will_remove_from_hass(self):
