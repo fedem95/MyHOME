@@ -232,7 +232,9 @@ class MyHOMEGatewayHandler:
                     self.hass.bus.async_fire("myhome_message_event", {"gateway": str(self.gateway.host), "message": str(message)})
 
             if not isinstance(message, OWNMessage):
-                LOGGER.warning(
+                # Expected on a routine session close/reconnect (EOF -> None),
+                # so log at DEBUG: it is not an anomaly.
+                LOGGER.debug(
                     "%s Data received is not a message: `%s`",
                     self.log_id,
                     message,
