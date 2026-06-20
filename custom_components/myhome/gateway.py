@@ -228,7 +228,9 @@ class MyHOMEGatewayHandler:
                     _event_content = {"gateway": str(self.gateway.host)}
                     _event_content.update(message.event_content)
                     self.hass.bus.async_fire("myhome_message_event", _event_content)
-                else:
+                elif message is not None:
+                # EOF di routine -> get_next() restituisce None: non è un evento,
+                # non lo immettiamo sul bus (coerente col declassamento a DEBUG del log).
                     self.hass.bus.async_fire("myhome_message_event", {"gateway": str(self.gateway.host), "message": str(message)})
 
             if not isinstance(message, OWNMessage):
