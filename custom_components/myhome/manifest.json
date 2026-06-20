@@ -10,7 +10,7 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/fedem95/MyHOME/issues",
   "requirements": [
-    "OWNd @ git+https://github.com/fedem95/OWNd@v1.0.1"
+    "OWNd @ git+https://github.com/fedem95/OWNd@v1.0.2"
   ],
   "ssdp": [
     {
@@ -69,5 +69,5 @@
       "modelName": "MH201"
     }
   ],
-  "version": "0.9.71"
+  "version": "0.9.72"
 }
