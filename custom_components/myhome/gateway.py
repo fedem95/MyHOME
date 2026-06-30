@@ -271,8 +271,7 @@ class MyHOMEGatewayHandler:
                                 "myhome_general_light_event",
                                 {"message": str(message), "event": event},
                             )
-                            await asyncio.sleep(0.1)
-                            await self.send_status_request(OWNLightingCommand.status("0"))
+                            self.hass.async_create_task(self._delayed_status_request(OWNLightingCommand.status("0")))
                         elif message.is_area:
                             is_event = True
                             event = "on" if message.is_on else "off"
@@ -284,8 +283,7 @@ class MyHOMEGatewayHandler:
                                     "event": event,
                                 },
                             )
-                            await asyncio.sleep(0.1)
-                            await self.send_status_request(OWNLightingCommand.status(message.area))
+                            self.hass.async_create_task(self._delayed_status_request(OWNLightingCommand.status(message.area)))
                         elif message.is_group:
                             is_event = True
                             event = "on" if message.is_on else "off"
@@ -542,3 +540,8 @@ class MyHOMEGatewayHandler:
             self.log_id,
             message,
         )
+
+    async def _delayed_status_request(self, command):
+        await asyncio.sleep(0.1)
+        await self.send_status_request(command)
+

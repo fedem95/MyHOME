@@ -65,6 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             entry.data[CONF_MAC]
         ]
     else:
+        LOGGER.error("Gateway with MAC %s is not configured in %s", entry.data[CONF_MAC], _config_file_path)
         return False
 
     # Migrating the config entry's unique_id if it was not formated to the recommended hass standard
